@@ -1,0 +1,54 @@
+{
+  "description": "BFCL_v3_parallel.json parallel_102",
+  "meta": {
+    "full_size": 284,
+    "stripped_size": 284,
+    "features": [
+      "additionalProperties"
+    ],
+    "raw_features": [
+      "_boolSchema",
+      "properties",
+      "required",
+      "type",
+      "type:number",
+      "type:object"
+    ]
+  },
+  "schema": {
+    "type": "object",
+    "properties": {
+      "calc_absolute_pressure": {
+        "type": "object",
+        "properties": {
+          "atm_pressure": {
+            "type": "number"
+          },
+          "gauge_pressure": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "gauge_pressure"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "calc_absolute_pressure"
+    ],
+    "additionalProperties": false
+  },
+  "tests": [
+    {
+      "description": "from BFCL ground truth",
+      "valid": true,
+      "data": {
+        "calc_absolute_pressure": {
+          "atm_pressure": 1.0,
+          "gauge_pressure": 2.5
+        }
+      }
+    }
+  ]
+}

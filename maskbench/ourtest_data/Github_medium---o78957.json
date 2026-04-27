@@ -1,0 +1,340 @@
+{
+  "description": "sample Github_medium/o78957.json",
+  "meta": {
+    "full_size": 2427,
+    "stripped_size": 1358,
+    "features": [
+      "$ref",
+      "@minmaxItems",
+      "additionalProperties",
+      "additionalProperties:object",
+      "anyOf",
+      "enum",
+      "items",
+      "pattern",
+      "patternProperties"
+    ],
+    "raw_features": [
+      "definitions",
+      "minItems",
+      "properties",
+      "required",
+      "type",
+      "type:array",
+      "type:object",
+      "type:string"
+    ]
+  },
+  "schema": {
+    "default": {},
+    "definitions": {
+      "propertyDefinition": {
+        "additionalProperties": {
+          "$ref": "#/definitions/propertyObject"
+        },
+        "default": {},
+        "type": "object"
+      },
+      "propertyObject": {
+        "patternProperties": {
+          "^x_": {}
+        },
+        "properties": {
+          "contentType": {
+            "description": "Defines the content type of the property",
+            "enum": [
+              "default",
+              "uid",
+              "xref",
+              "href",
+              "file",
+              "markdown"
+            ],
+            "type": "string"
+          },
+          "default": {},
+          "description": {
+            "type": "string"
+          },
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/propertyObject"
+              },
+              {
+                "$ref": "#/definitions/schemaArray"
+              }
+            ],
+            "default": {}
+          },
+          "mergeType": {
+            "description": "Defines how to merge the property",
+            "enum": [
+              "key",
+              "merge",
+              "replace",
+              "ignore"
+            ],
+            "type": "string"
+          },
+          "properties": {
+            "$ref": "#/definitions/propertyDefinition"
+          },
+          "reference": {
+            "description": "Defines whether current property is a reference to the actual value of the property",
+            "enum": [
+              "none",
+              "file"
+            ],
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "pattern": "^[^.]*$",
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/definitions/simpleTypes"
+          },
+          "xrefProperties": {
+            "description": "Defines the properties of current object when it is cross referenced by others. Each item is the name of the property in the instance.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "_uniqueItems": true
+          }
+        },
+        "type": "object"
+      },
+      "schemaArray": {
+        "items": {
+          "$ref": "#/definitions/propertyObject"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "simpleTypes": {
+        "enum": [
+          "array",
+          "boolean",
+          "integer",
+          "null",
+          "number",
+          "object",
+          "string"
+        ]
+      }
+    },
+    "properties": {
+      "$schema": {
+        "_format": "uri",
+        "description": "The version of the schema specification, for example, `https://github.com/dotnet/docfx/v1.0/schema#",
+        "type": "string"
+      },
+      "default": {},
+      "description": {
+        "type": "string"
+      },
+      "id": {
+        "description": "It is best practice to include an `id` property as an unique identifier for each schema.",
+        "type": "string"
+      },
+      "metadata": {
+        "_format": "json-pointer",
+        "type": "string"
+      },
+      "patternProperties": {
+        "^x_": {}
+      },
+      "properties": {
+        "$ref": "#/definitions/propertyDefinition"
+      },
+      "title": {
+        "description": "The title of current schema, `LandingPage`, for example. In DocFX, this value can be used to determine what kind of documents apply to this schema, If not specified, file name of this schema is used.",
+        "type": "string"
+      },
+      "type": {
+        "description": "The type of the root document model MUST be `object`",
+        "enum": [
+          "object"
+        ],
+        "type": "string"
+      },
+      "version": {
+        "description": "The version of current schema object",
+        "type": "string"
+      }
+    },
+    "required": [
+      "$schema",
+      "version"
+    ],
+    "title": "DocFX document schema meta-schema",
+    "type": "object"
+  },
+  "tests": [
+    {
+      "description": "llama 70b generated positive",
+      "valid": true,
+      "data": {
+        "$schema": "https://github.com/dotnet/docfx/v1.0/schema#",
+        "description": "This is an example schema",
+        "id": "example-schema",
+        "properties": {
+          "name": {
+            "description": "The name of the object",
+            "title": "Name",
+            "type": "string"
+          },
+          "age": {
+            "description": "The age of the object",
+            "title": "Age",
+            "type": "integer"
+          },
+          "address": {
+            "description": "The address of the object",
+            "properties": {
+              "street": {
+                "description": "The street of the address",
+                "title": "Street",
+                "type": "string"
+              },
+              "city": {
+                "description": "The city of the address",
+                "title": "City",
+                "type": "string"
+              },
+              "state": {
+                "description": "The state of the address",
+                "title": "State",
+                "type": "string"
+              },
+              "zip": {
+                "description": "The zip of the address",
+                "title": "Zip",
+                "type": "string"
+              }
+            },
+            "title": "Address",
+            "type": "object"
+          },
+          "hobbies": {
+            "description": "The hobbies of the object",
+            "items": {
+              "type": "string"
+            },
+            "title": "Hobbies",
+            "type": "array"
+          }
+        },
+        "title": "Example Schema",
+        "type": "object",
+        "version": "1.0"
+      }
+    },
+    {
+      "description": "llama 70b generated positive",
+      "valid": true,
+      "data": {
+        "$schema": "https://github.com/dotnet/docfx/v1.0/schema#",
+        "description": "This is an example schema",
+        "id": "example-schema",
+        "properties": {
+          "name": {
+            "description": "The name of the object",
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "description": "The description of the object",
+            "title": "Description",
+            "type": "string"
+          },
+          "tags": {
+            "description": "The tags of the object",
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "xref": {
+            "contentType": "xref",
+            "description": "The cross reference of the object",
+            "title": "Cross Reference",
+            "type": "string"
+          },
+          "file": {
+            "contentType": "file",
+            "description": "The file of the object",
+            "title": "File",
+            "type": "string"
+          },
+          "markdown": {
+            "contentType": "markdown",
+            "description": "The markdown of the object",
+            "title": "Markdown",
+            "type": "string"
+          },
+          "uid": {
+            "contentType": "uid",
+            "description": "The unique identifier of the object",
+            "title": "Unique Identifier",
+            "type": "string"
+          },
+          "href": {
+            "contentType": "href",
+            "description": "The hyperlink of the object",
+            "title": "Hyperlink",
+            "type": "string"
+          },
+          "mergeType": {
+            "description": "The merge type of the object",
+            "title": "Merge Type",
+            "type": "string",
+            "enum": [
+              "key",
+              "merge",
+              "replace",
+              "ignore"
+            ]
+          },
+          "reference": {
+            "description": "The reference of the object",
+            "title": "Reference",
+            "type": "string",
+            "enum": [
+              "none",
+              "file"
+            ]
+          },
+          "xrefProperties": {
+            "description": "The cross reference properties of the object",
+            "items": {
+              "type": "string"
+            },
+            "title": "Cross Reference Properties",
+            "type": "array"
+          },
+          "items": {
+            "description": "The items of the object",
+            "items": {
+              "$ref": "#/definitions/propertyObject"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "title": "Example Schema",
+        "type": "object",
+        "version": "1.0"
+      }
+    }
+  ]
+}
