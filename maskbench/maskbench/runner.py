@@ -38,6 +38,16 @@ def process_file(engine: Engine, file: str):
     with open(file) as f:
         pos_data = json.loads(f.read())
 
+    # Skip schemas with no test cases — write a no-tests marker so the
+    # run script doesn't re-queue this file every round.
+    if not pos_data.get("tests"):
+        status = {"id": id, "no_tests": True, "num_tokens": 0, "num_tests": 0,
+                  "ttfm_us": 0, "max_ttfm_us": 0, "masks_us": 0, "max_mask_us": 0,
+                  "all_mask_us": [], "num_valid_tests": 0, "num_invalid_tests": 0}
+        with open(output_name, "w") as f:
+            f.write(json.dumps(status, indent=2))
+        return status
+
     all_mask_us = []
     status = {
         "id": id,
@@ -97,9 +107,26 @@ def process_file(engine: Engine, file: str):
                     break
 
             if accepted and not test["valid"]:
-                status["validation_error"] = f"test #{i}: should reject but didn't"
+                # Log details for false accepts
+                detail = f"test #{i}: should reject but didn't"
+                detail += f" | data={json.dumps(test['data'])[:200]}"
+                # Identify which constraint was violated
+                schema = pos_data.get("schema", {})
+                schema_str = json.dumps(schema)
+                features = [kw for kw in ['pattern', 'enum', 'const', '$ref',
+                    'oneOf', 'anyOf', 'required', 'additionalProperties',
+                    'minLength', 'maxLength', 'minItems', 'maxItems']
+                    if f'"{kw}"' in schema_str]
+                detail += f" | schema_features={features}"
+                status["validation_error"] = detail
             elif not accepted and test["valid"]:
-                status["validation_error"] = f"test #{i}: should accept but didn't"
+                # Log details for false rejects
+                rejected_token = engine.tokenizer.decode([t]) if not ok else "?"
+                detail = f"test #{i}: should accept but didn't"
+                detail += f" | rejected_at_token={tidx}/{len(tokens)}"
+                detail += f" | rejected_token={repr(rejected_token)}"
+                detail += f" | data={json.dumps(test['data'])[:200]}"
+                status["validation_error"] = detail
             else:
                 if test["valid"]:
                     status["num_valid_tests"] += 1
@@ -158,6 +185,15 @@ def setup_argparse():
     parser.add_argument(
         "--llamacpp", action="store_true", help="Enable llama.cpp grammars"
     )
+    parser.add_argument(
+        "--instagrammar", action="store_true", help="Enable InstaGrammar"
+    )
+    parser.add_argument(
+        "--instagrammar-lp", action="store_true", help="Enable InstaGrammar (lexer-parser mode)"
+    )
+    parser.add_argument(
+        "--syncode", action="store_true", help="Enable Syncode"
+    )
     parser.add_argument("--output", type=str, help="Output path")
     parser.add_argument(
         "--tokenizer",
@@ -174,6 +210,21 @@ def setup_argparse():
     )
 
     defl_cpu = min(os.cpu_count(), 40)
+    # Memory-aware default: heavy engines (instagrammar) use ~2-4GB per
+    # subprocess during compilation.  Cap concurrency so peak usage stays
+    # under 75% of system RAM.
+    try:
+        import shutil
+        _total_gb = shutil.disk_usage("/").total  # fallback, overridden below
+        with open("/proc/meminfo") as _f:
+            for _line in _f:
+                if _line.startswith("MemTotal:"):
+                    _total_gb = int(_line.split()[1]) / (1024 * 1024)
+                    break
+        _mem_threads = max(1, int(_total_gb * 0.75 / 4))  # ~4GB per worker
+        defl_cpu = min(defl_cpu, _mem_threads)
+    except Exception:
+        pass
     parser.add_argument(
         "--num-threads", type=int, default=defl_cpu, help="Number of threads to run"
     )
@@ -219,6 +270,24 @@ def get_engine(args) -> Engine:
 
         assert not engine, "Multiple engines specified"
         engine = LlamaCppEngine()
+
+    if args.instagrammar:
+        from .instagrammar_engine import InstaGrammarEngine
+
+        assert not engine, "Multiple engines specified"
+        engine = InstaGrammarEngine()
+
+    if getattr(args, 'instagrammar_lp', False):
+        from .instagrammar_lp_engine import InstaGrammarLPEngine
+
+        assert not engine, "Multiple engines specified"
+        engine = InstaGrammarLPEngine()
+
+    if args.syncode:
+        from .syncode_engine import SyncodeEngine
+
+        assert not engine, "Multiple engines specified"
+        engine = SyncodeEngine()
 
     if not engine:
         raise Exception("No grammar engine specified")

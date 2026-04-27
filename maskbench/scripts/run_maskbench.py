@@ -12,6 +12,7 @@ import time
 output_path = "tmp/output/"
 cmd = ["python3", "-m", "maskbench.runner", "--multi"]
 log_lock = Lock()
+_worker_env = None  # set in main before processing starts
 
 
 def run_cmd(file_list: list[str]):
@@ -24,6 +25,7 @@ def run_cmd(file_list: list[str]):
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            env=_worker_env,
         )
         log_entry += f"{result.stderr}{result.stdout}\nExit code: {result.returncode}\n"
     except Exception as e:
@@ -161,5 +163,14 @@ if __name__ == "__main__":
                 indent=2,
             )
         )
+
+    # Set OMP_NUM_THREADS to avoid oversubscription:
+    # N worker subprocesses × M OMP threads should not exceed total cores.
+    total_cores = os.cpu_count() or 4
+    omp_per_worker = max(1, total_cores // args.num_threads)
+    _worker_env = os.environ.copy()
+    _worker_env["OMP_NUM_THREADS"] = str(omp_per_worker)
+    print(f"OMP_NUM_THREADS={omp_per_worker} per worker ({args.num_threads} workers, {total_cores} cores)",
+          file=sys.stderr)
 
     process_files_in_threads(file_list, thread_count=args.num_threads, chunk_size=100)
