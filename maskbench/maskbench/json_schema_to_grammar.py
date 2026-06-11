@@ -662,8 +662,15 @@ class SchemaConverter:
             out.append(") space")
             return self._add_rule(rule_name, ''.join(out))
 
-        elif (schema_type == 'object') or (len(schema) == 0):
+        elif schema_type == 'object':
             return self._add_rule(rule_name, self._add_primitive('object', PRIMITIVE_RULES['object']))
+
+        elif len(schema) == 0:
+            # Empty schema {} matches any JSON value per JSON Schema
+            # spec; the upstream llama.cpp converter narrows it to
+            # ``object`` which rejects schemas like ``{"foo": {}}`` when
+            # the data has a string/number/etc. value.
+            return self._add_rule(rule_name, self._add_primitive('value', PRIMITIVE_RULES['value']))
 
         else:
             assert schema_type in PRIMITIVE_RULES, f'Unrecognized schema: {schema}'

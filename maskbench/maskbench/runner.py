@@ -194,6 +194,9 @@ def setup_argparse():
     parser.add_argument(
         "--syncode", action="store_true", help="Enable Syncode"
     )
+    parser.add_argument(
+        "--formatron", action="store_true", help="Enable Formatron"
+    )
     parser.add_argument("--output", type=str, help="Output path")
     parser.add_argument(
         "--tokenizer",
@@ -288,6 +291,12 @@ def get_engine(args) -> Engine:
 
         assert not engine, "Multiple engines specified"
         engine = SyncodeEngine()
+
+    if getattr(args, 'formatron', False):
+        from .formatron_engine import FormatronEngine
+
+        assert not engine, "Multiple engines specified"
+        engine = FormatronEngine()
 
     if not engine:
         raise Exception("No grammar engine specified")
