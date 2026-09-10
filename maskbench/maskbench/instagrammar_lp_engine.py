@@ -1,14 +1,16 @@
 """MaskBench engine adapter for InstaGrammar lexer-parser mode.
 
 Benchmarks the SERVING path (identical to the vLLM backend): phases=4
-compile (trace-signature table -> complete masks by pure retrieval), a
-template matcher cloned per test, and per-token fills through the C
-row path (canonical fill key -> shared C mask cache; misses assemble
-once via retrieval and insert). Masks are COMPLETE (boundary-spanning),
-comparable to llguidance/xgrammar.
+compile (trace-signature table -> complete masks by pure retrieval) plus
+a best-effort cache prewarm (cold fills move to load = GCT), a template
+matcher cloned per test, and per-token fills through the C row path
+(canonical fill key -> shared C mask cache; a state the prewarm missed
+takes its one cold fill in the same C call). Masks are COMPLETE
+(boundary-spanning), comparable to llguidance/xgrammar.
 
 compute_mask() does the timed mask fill; commit_token() advances. The
-runner times them together per token; TTFM is the phases=4 compile.
+runner times them together per token; TTFM is the phases=4 compile
+including the prewarm.
 """
 
 import collections
@@ -71,10 +73,21 @@ class InstaGrammarLPEngine(Engine):
             return
 
         # phases=4: trace-signature table (complete masks by retrieval) --
-        # the exact compile the vLLM backend ships. TTFM == this call.
+        # the exact compile the vLLM backend ships. TTFM == this call,
+        # including the prewarm below.
         compiled = self._compiler.compile_schema(schema, verbose=0, phases=4)
         compiled._clp_flat = _flatten_grammar(compiled)
         compiled._clp_template = CLPMatcher(compiled)  # owns shared C cache
+        # Pre-pay cold fills at load: BFS-warm the template's shared C mask
+        # cache so serving is retrieval-only (states the budget misses still
+        # take one cold fill in C at serving time). The C-side walk finishes
+        # closure-complete grammars in well under the 1s cap; the cap exists
+        # for data-shaped state spaces (e.g. free-text pattern terminals)
+        # where more exploration cannot reach the serving states anyway.
+        from instagrammar.lexer_parser._c_matcher import prewarm_cache
+        prewarm_cache(CLPMatcher(compiled, mask_cache={},
+                                 template=compiled._clp_template),
+                      budget=10_000_000, time_limit_s=1.0)
         self._compiled = compiled
         self._cache[self._current_key] = compiled
         while len(self._cache) > _CACHE_MAX:
@@ -96,13 +109,14 @@ class InstaGrammarLPEngine(Engine):
 
     def compute_mask(self):
         m = self._matcher
-        st = m.fill_row_into(self._row)
-        if st == 1:
-            return                          # warm: one C call (key+cache+copy)
+        # ONE C call, warm AND cold: key -> shared C cache -> row memcpy;
+        # a prewarm-missed state is assembled and inserted inside the call.
+        st = m.fill_trace_row_into(self._row)
+        if st > 0:
+            return
         if st == -1:
             raise RuntimeError("matcher state truncated (config explosion)")
-        # cold state: assemble COMPLETE mask once via retrieval, insert into
-        # the shared C cache (subsequent visits are warm)
+        # no C trace table attached: python retrieval fallback
         mask = m.fill_next_token_bitmask_retrieval()
         m.fill_row_insert_into(np.ascontiguousarray(mask), self._row)
 

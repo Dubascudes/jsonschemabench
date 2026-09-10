@@ -167,7 +167,8 @@ if __name__ == "__main__":
     # Set OMP_NUM_THREADS to avoid oversubscription:
     # N worker subprocesses × M OMP threads should not exceed total cores.
     total_cores = os.cpu_count() or 4
-    omp_per_worker = max(1, total_cores // args.num_threads)
+    omp_per_worker = int(os.environ.get('OMP_NUM_THREADS',
+                                        max(1, total_cores // args.num_threads)))
     _worker_env = os.environ.copy()
     _worker_env["OMP_NUM_THREADS"] = str(omp_per_worker)
     print(f"OMP_NUM_THREADS={omp_per_worker} per worker ({args.num_threads} workers, {total_cores} cores)",
