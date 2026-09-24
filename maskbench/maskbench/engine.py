@@ -38,6 +38,12 @@ class Engine:
     def commit_token(self, token: int) -> bool:
         raise NotImplementedError()
 
+    def compile_extras(self) -> dict:
+        """Engine-specific fields merged into the per-schema status record
+        (e.g. a compile-time breakdown). ttfm_us stays the runner's own
+        measurement of compile_grammar."""
+        return {}
+
     def log_single(self, s: str):
         import sys
 

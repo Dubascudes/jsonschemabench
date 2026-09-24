@@ -142,6 +142,7 @@ def process_file(engine: Engine, file: str):
     status["masks_us"] = masks_us
     status["max_mask_us"] = max_mask_us
     status["num_tokens"] = num_tokens
+    status.update(engine.compile_extras())
 
     st = json.dumps(status, indent=2)
     engine.log_single(st)
