@@ -126,7 +126,35 @@ class InstaGrammarLPEngine(Engine):
                 extras["ig_prewarm_bg_us"] = (
                     int(pw.elapsed_s * 1e6) if pw.elapsed_s is not None
                     else None)
+        extras.update(self._table_stats())
         return extras
+
+    def _table_stats(self) -> dict:
+        """Signature count and memory of the compiled grammar: the static
+        serving tables (C trace table buffers plus the flattened matcher
+        grammar) and the shared runtime caches after this schema's replay."""
+        compiled = getattr(self, "_compiled", None)
+        if compiled is None:
+            return {}
+        try:
+            from instagrammar.lexer_parser._c_matcher import cache_mem_stats
+            tr = compiled.trace_retrieval
+            nbytes = lambda xs: sum(int(a.nbytes) for a in xs
+                                    if isinstance(a, np.ndarray))
+            flat = getattr(compiled, "_clp_flat", None) or {}
+            stats = {
+                "ig_n_signatures": int(tr.sigs.n_signatures),
+                "ig_n_parser_states": int(compiled.parser_pda.n_states),
+                "ig_trace_table_bytes": nbytes(getattr(tr, "_c_arrays", ()) or ()),
+                "ig_matcher_table_bytes": nbytes(
+                    flat.values() if isinstance(flat, dict) else ()),
+            }
+            if self._matcher is not None:
+                stats["ig_cache_bytes"] = int(sum(
+                    v for v in cache_mem_stats(self._matcher).values()))
+            return stats
+        except Exception as e:  # stats must never fail a benchmark row
+            return {"ig_table_stats_error": repr(e)[:200]}
 
     def reset(self):
         if self._matcher is not None and self._matcher_key == self._current_key:
