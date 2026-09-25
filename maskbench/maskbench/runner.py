@@ -15,6 +15,9 @@ from .engine import Engine
 from transformers import AutoTokenizer
 
 
+warm_replay = False
+
+
 def time_us(prev: float) -> int:
     return int((time.monotonic() - prev) * 1000000)
 
@@ -79,6 +82,7 @@ def process_file(engine: Engine, file: str):
     masks_us = 0
     max_mask_us = 0
     num_tokens = 0
+    cold_accepted = []
 
     for i, test in enumerate(pos_data["tests"]):
         engine.reset()
@@ -138,6 +142,10 @@ def process_file(engine: Engine, file: str):
                 traceback.print_exc()
             status["validation_error"] = f"test #{i}: EXN {repr(e)}"
             accepted = False
+        cold_accepted.append(accepted)
+
+    if warm_replay:
+        _warm_pass(engine, pos_data["tests"], cold_accepted, status)
 
     status["masks_us"] = masks_us
     status["max_mask_us"] = max_mask_us
@@ -150,6 +158,39 @@ def process_file(engine: Engine, file: str):
         f.write(st)
 
     return status
+
+
+def _warm_pass(engine: Engine, tests, cold_accepted, status):
+    """Replay every test again on the same compiled grammar.
+
+    Models a schema reused across requests: engine-side caches filled by the
+    first (cold) pass stay warm. Timings go to separate warm_* fields; the
+    cold fields keep their meaning. warm_outcome_mismatches counts tests whose
+    accept/reject result differs from the cold pass (expected: 0).
+    """
+    warm_all = []
+    mismatches = 0
+    for test, cold in zip(tests, cold_accepted):
+        instance = json.dumps(test["data"], indent=None, ensure_ascii=False)
+        tokens = engine.tokenizer.encode(instance, add_special_tokens=False)
+        accepted = True
+        try:
+            engine.reset()
+            for t in tokens:
+                t2 = time.monotonic()
+                engine.compute_mask()
+                ok = engine.commit_token(t)
+                warm_all.append(time_us(t2))
+                if not ok:
+                    accepted = False
+                    break
+        except Exception:
+            accepted = False
+        mismatches += accepted != cold
+    status["warm_all_mask_us"] = warm_all
+    status["warm_masks_us"] = sum(warm_all)
+    status["warm_num_tokens"] = len(warm_all)
+    status["warm_outcome_mismatches"] = mismatches
 
 
 class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
@@ -238,6 +279,10 @@ def setup_argparse():
     )
 
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument(
+        "--warm-replay", action="store_true",
+        help="After the timed replay, replay all tests again on the same compiled "
+             "grammar and record warm_* timings")
 
     parser.add_argument(
         "files", metavar="file", type=str, nargs="+", help="List of files to process"
@@ -328,7 +373,7 @@ def get_files(args):
 
 
 def main():
-    global output_path
+    global output_path, warm_replay
 
     parser = setup_argparse()
 
@@ -343,6 +388,7 @@ def main():
 
     engine = get_engine(args)
     output_path = get_output(args)
+    warm_replay = args.warm_replay
 
     engine.tokenizer = AutoTokenizer.from_pretrained(
         engine.tokenizer_model_id
