@@ -40,7 +40,9 @@ class LlgEngine(Engine):
         fill_next_token_bitmask(self.interp, self.mask_data, 0)
 
     def commit_token(self, t: int) -> bool:
-        ok = (self.mask_data[0, t // 32] & (1 << (t % 32))) != 0
+        # Shift instead of masking with (1 << 31): numpy 2 raises OverflowError
+        # when a Python int outside int32 range is combined with an int32 array.
+        ok = ((int(self.mask_data[0, t // 32]) >> (t % 32)) & 1) != 0
         if ok:
             self.interp.consume_token(t)
         elif self.interp.is_error():
