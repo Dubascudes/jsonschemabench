@@ -19,7 +19,32 @@ def time_us(prev: float) -> int:
     return int((time.monotonic() - prev) * 1000000)
 
 
+CHECKPOINT_S = 30.0
+
+
+def _write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(obj, indent=2))
+    os.replace(tmp, path)
+
+
+def _peak_rss_kb():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
 def process_file(engine: Engine, file: str):
+    """Compile one workload file and replay its tests token by token.
+
+    A file is either a MaskBench schema ({"schema", "tests": [{"data",
+    "valid"}]}) or a grammar workload ({"grammars": {format: text}, "tests":
+    [{"text", "valid"}]}). Per token the runner records wall time
+    (all_mask_us) and this thread's CPU time (all_mask_cpu_us) of
+    compute_mask + commit_token; a large wall-minus-CPU gap marks a stall
+    (preemption, page reclaim) rather than algorithmic cost. After the last
+    token, engines implementing check_complete() are asked whether EOS is
+    allowed, so a valid-prefix-but-incomplete input counts as rejected.
+    Partial results are checkpointed, so a timeout keeps finished tests."""
     id = os.path.basename(file)
     output_name = os.path.join(output_path, id)
 
@@ -37,6 +62,7 @@ def process_file(engine: Engine, file: str):
 
     with open(file) as f:
         pos_data = json.loads(f.read())
+    is_grammar = "grammars" in pos_data
 
     # Skip schemas with no test cases — write a no-tests marker so the
     # run script doesn't re-queue this file every round.
@@ -44,13 +70,15 @@ def process_file(engine: Engine, file: str):
         status = {"id": id, "no_tests": True, "num_tokens": 0, "num_tests": 0,
                   "ttfm_us": 0, "max_ttfm_us": 0, "masks_us": 0, "max_mask_us": 0,
                   "all_mask_us": [], "num_valid_tests": 0, "num_invalid_tests": 0}
-        with open(output_name, "w") as f:
-            f.write(json.dumps(status, indent=2))
+        _write_json(output_name, status)
         return status
 
     all_mask_us = []
+    all_mask_cpu_us = []
     status = {
         "id": id,
+        "workload_kind": "grammar" if is_grammar else "json_schema",
+        "complete": False,
         "ttfm_us": 0,
         "max_ttfm_us": 0,
         "masks_us": 0,
@@ -58,41 +86,69 @@ def process_file(engine: Engine, file: str):
         "num_tokens": 0,
         "num_tests": len(pos_data["tests"]),
         "all_mask_us": all_mask_us,
+        "all_mask_cpu_us": all_mask_cpu_us,
         "num_valid_tests": 0,
         "num_invalid_tests": 0,
+        "adapter": getattr(engine, "benchmark_contract", None),
+        "test_results": [],
+        "completion_us": 0,
     }
 
     try:
         t0 = time.monotonic()
-        engine.compile_grammar(pos_data["schema"])
+        c0 = time.process_time()
+        if is_grammar:
+            engine.compile_workload(pos_data["grammars"])
+        else:
+            engine.compile_grammar(pos_data["schema"])
     except Exception as e:
         if not engine.multi:
             traceback.print_exc()
         status["compile_error"] = repr(e)
-        with open(output_name, "w") as f:
-            f.write(json.dumps(status, indent=2))
+        status["ttfm_failed_after_us"] = time_us(t0)
+        # Adapter exceptions may distinguish unsupported frontends from
+        # parser/matcher errors without changing existing result fields.
+        if hasattr(e, "outcome"):
+            status["outcome"] = e.outcome
+            status["error_stage"] = e.stage
+        status["peak_rss_kb"] = _peak_rss_kb()
+        status["complete"] = True
+        _write_json(output_name, status)
         return status
 
     status["ttfm_us"] = time_us(t0)
+    status["ttfm_cpu_us"] = int((time.process_time() - c0) * 1e6)
     status["max_ttfm_us"] = status["ttfm_us"]
+    status["peak_rss_after_compile_kb"] = _peak_rss_kb()
+    if hasattr(engine, "compile_breakdown"):
+        status["compile_breakdown"] = engine.compile_breakdown()
+    status["outcome"] = "supported"
 
     masks_us = 0
     max_mask_us = 0
     num_tokens = 0
+    last_checkpoint = time.monotonic()
 
     for i, test in enumerate(pos_data["tests"]):
-        engine.reset()
-
-        instance = json.dumps(test["data"], indent=None, ensure_ascii=False)
-        tokens = engine.tokenizer.encode(instance, add_special_tokens=False)
-
         accepted = True
+        test_error = None
+        eof_checked = False
+        rejected_at = None
+        tokens = []
+        if "text" in test:
+            instance = test["text"]
+        else:
+            instance = json.dumps(test["data"], indent=None, ensure_ascii=False)
         try:
+            tokens = engine.tokenizer.encode(instance, add_special_tokens=False)
+            engine.reset()
             for tidx, t in enumerate(tokens):
                 t2 = time.monotonic()
+                c2 = time.thread_time()
                 engine.compute_mask()
                 ok = engine.commit_token(t)
                 mask_time = time_us(t2)
+                all_mask_cpu_us.append(int((time.thread_time() - c2) * 1e6))
                 if engine.debug:
                     engine.log_single(
                         f"Token {tidx} {repr(engine.tokenizer.decode([t]))}: {ok}"
@@ -104,28 +160,41 @@ def process_file(engine: Engine, file: str):
                     max_mask_us = mask_time
                 if not ok:
                     accepted = False
+                    rejected_at = tidx
                     break
 
+            if accepted and hasattr(engine, "check_complete"):
+                t_complete = time.monotonic()
+                accepted = engine.check_complete()
+                eof_checked = True
+                status["completion_us"] += time_us(t_complete)
+                if not accepted:
+                    rejected_at = len(tokens)
+
+            shown = instance[:200]
             if accepted and not test["valid"]:
                 # Log details for false accepts
                 detail = f"test #{i}: should reject but didn't"
-                detail += f" | data={json.dumps(test['data'])[:200]}"
-                # Identify which constraint was violated
-                schema = pos_data.get("schema", {})
-                schema_str = json.dumps(schema)
-                features = [kw for kw in ['pattern', 'enum', 'const', '$ref',
-                    'oneOf', 'anyOf', 'required', 'additionalProperties',
-                    'minLength', 'maxLength', 'minItems', 'maxItems']
-                    if f'"{kw}"' in schema_str]
-                detail += f" | schema_features={features}"
+                detail += f" | data={json.dumps(shown)}"
+                if not is_grammar:
+                    # Identify which constraint was violated
+                    schema_str = json.dumps(pos_data.get("schema", {}))
+                    features = [kw for kw in ['pattern', 'enum', 'const', '$ref',
+                        'oneOf', 'anyOf', 'required', 'additionalProperties',
+                        'minLength', 'maxLength', 'minItems', 'maxItems']
+                        if f'"{kw}"' in schema_str]
+                    detail += f" | schema_features={features}"
                 status["validation_error"] = detail
             elif not accepted and test["valid"]:
                 # Log details for false rejects
-                rejected_token = engine.tokenizer.decode([t]) if not ok else "?"
+                if rejected_at is not None and rejected_at < len(tokens):
+                    rejected_token = engine.tokenizer.decode([tokens[rejected_at]])
+                else:
+                    rejected_token = "<EOS>"
                 detail = f"test #{i}: should accept but didn't"
-                detail += f" | rejected_at_token={tidx}/{len(tokens)}"
+                detail += f" | rejected_at_token={rejected_at}/{len(tokens)}"
                 detail += f" | rejected_token={repr(rejected_token)}"
-                detail += f" | data={json.dumps(test['data'])[:200]}"
+                detail += f" | data={json.dumps(shown)}"
                 status["validation_error"] = detail
             else:
                 if test["valid"]:
@@ -138,15 +207,41 @@ def process_file(engine: Engine, file: str):
                 traceback.print_exc()
             status["validation_error"] = f"test #{i}: EXN {repr(e)}"
             accepted = False
+            test_error = repr(e)
+            status["outcome"] = "error"
+            status["error_stage"] = getattr(e, "stage", "replay")
+
+        status["test_results"].append({
+            "index": i, "expected_valid": test["valid"],
+            "kind": test.get("kind"),
+            "accepted": accepted if test_error is None else None,
+            "error": test_error,
+            "eof_checked": eof_checked,
+            "num_tokens": len(tokens),
+            "rejected_at": rejected_at,
+        })
+        if test_error is None and accepted != test["valid"] and status["outcome"] != "error":
+            status["outcome"] = "validation_error"
+
+        if time.monotonic() - last_checkpoint > CHECKPOINT_S:
+            status["masks_us"], status["max_mask_us"] = masks_us, max_mask_us
+            status["num_tokens"] = num_tokens
+            status["tests_done"] = i + 1
+            _write_json(output_name, status)
+            last_checkpoint = time.monotonic()
 
     status["masks_us"] = masks_us
     status["max_mask_us"] = max_mask_us
     status["num_tokens"] = num_tokens
+    status["tests_done"] = len(pos_data["tests"])
+    status["peak_rss_kb"] = _peak_rss_kb()
+    if hasattr(engine, "replay_stats"):
+        status["replay_stats"] = engine.replay_stats()
+    status["complete"] = True
 
-    st = json.dumps(status, indent=2)
-    engine.log_single(st)
-    with open(output_name, "w") as f:
-        f.write(st)
+    engine.log_single(json.dumps({k: v for k, v in status.items()
+                                  if k not in ("all_mask_us", "all_mask_cpu_us")}, indent=2))
+    _write_json(output_name, status)
 
     return status
 
@@ -196,6 +291,12 @@ def setup_argparse():
     )
     parser.add_argument(
         "--formatron", action="store_true", help="Enable Formatron"
+    )
+    parser.add_argument(
+        "--psc", action="store_true", help="Enable PSC (parser stack classification)"
+    )
+    parser.add_argument(
+        "--greatgramma", action="store_true", help="Enable GreatGramma"
     )
     parser.add_argument("--output", type=str, help="Output path")
     parser.add_argument(
@@ -297,6 +398,18 @@ def get_engine(args) -> Engine:
 
         assert not engine, "Multiple engines specified"
         engine = FormatronEngine()
+
+    if getattr(args, 'psc', False):
+        from .psc_engine import PscEngine
+
+        assert not engine, "Multiple engines specified"
+        engine = PscEngine()
+
+    if getattr(args, 'greatgramma', False):
+        from .greatgramma_engine import GreatGrammaEngine
+
+        assert not engine, "Multiple engines specified"
+        engine = GreatGrammaEngine()
 
     if not engine:
         raise Exception("No grammar engine specified")
