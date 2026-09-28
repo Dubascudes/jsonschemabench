@@ -7,6 +7,14 @@ import json
 
 
 class LlgEngine(Engine):
+    # PSC's matching: llguidance consumes the Lark grammar with terminal
+    # priorities stripped (unsupported), with forcing disabled as in PSC's
+    # own llguidance harness.
+    grammar_format = "lark_llg"
+    benchmark_contract = {
+        "timed_operation": "fill_next_token_bitmask + mask-bit check + consume_token",
+        "acceptance": "token must be set in the mask; EOS bit checked after the last token",
+    }
 
     def __init__(self):
         super().__init__()
@@ -33,6 +41,13 @@ class LlgEngine(Engine):
         if self.interp.is_error():
             raise ValueError(self.interp.get_error())
 
+    def compile_text_grammar(self, grammar: str):
+        self.interp0 = llg.LLMatcher(
+            self.llg_tokenizer, '%llguidance { "no_forcing": true }\n' + grammar)
+        self.interp = self.interp0
+        if self.interp.is_error():
+            raise ValueError(self.interp.get_error())
+
     def reset(self):
         self.interp = self.interp0.deep_copy()
 
@@ -48,3 +63,7 @@ class LlgEngine(Engine):
         elif self.interp.is_error():
             raise ValueError(self.interp.get_error())
         return ok
+
+    def check_complete(self) -> bool:
+        fill_next_token_bitmask(self.interp, self.mask_data, 0)
+        return self.eos_allowed(self.mask_data)

@@ -5,6 +5,14 @@ import xgrammar as xgr
 
 
 class XgrEngine(Engine):
+    # PSC's matching: XGrammar consumes the GBNF version of each language.
+    grammar_format = "gbnf"
+    benchmark_contract = {
+        "timed_operation": "fill_next_token_bitmask + mask-bit check + accept_token",
+        "acceptance": "token must be set in the mask it was offered from; "
+                      "EOS bit checked after the last token",
+    }
+
     def __init__(self):
         super().__init__()
         self.compliant = False
@@ -59,6 +67,9 @@ class XgrEngine(Engine):
             )
         # print(compiled_grammar.grammar, file=sys.stderr)
 
+    def compile_text_grammar(self, grammar: str):
+        self.compiled_grammar = self.xgr_compiler.compile_grammar(grammar)
+
     def reset(self):
         self.matcher = xgr.GrammarMatcher(self.compiled_grammar)
 
@@ -66,6 +77,14 @@ class XgrEngine(Engine):
         self.matcher.fill_next_token_bitmask(self.token_bitmask)
 
     def commit_token(self, t: int) -> bool:
-        # TODO: check in self.token_bitmask
-        ok = self.matcher.accept_token(t)
-        return ok
+        # Judge the token by the mask XGrammar just produced, as the
+        # llguidance and InstaGrammar adapters do; accept_token alone would
+        # hide a mask that forbids a token the matcher can still consume.
+        word = int(self.token_bitmask[0, t // 32])
+        if not (word >> (t % 32)) & 1:
+            return False
+        return self.matcher.accept_token(t)
+
+    def check_complete(self) -> bool:
+        self.matcher.fill_next_token_bitmask(self.token_bitmask)
+        return self.eos_allowed(self.token_bitmask.numpy())

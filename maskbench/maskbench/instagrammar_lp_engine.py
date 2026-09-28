@@ -9,10 +9,13 @@ Masks are COMPLETE (boundary-spanning), comparable to llguidance/xgrammar.
 
 compute_mask() does the timed mask fill; commit_token() advances. The
 runner times them together per token; TTFM is the whole compile_grammar
-call, including any synchronous prewarm. INSTAGRAMMAR_PREWARM selects the
-prewarm (none / initial [default] / capped / background, see
-instagrammar.lexer_parser._c_matcher.start_prewarm); compile_extras()
-reports the compile / matcher-setup / prewarm split per schema.
+(or compile_text_grammar) call, including any synchronous prewarm.
+INSTAGRAMMAR_PREWARM selects the prewarm (none / initial [default] /
+capped / background, see instagrammar.lexer_parser._c_matcher.start_prewarm).
+compile_extras() reports the compile / matcher-setup / prewarm split per
+schema (compile_breakdown() is the same split under the audit's names);
+replay_stats() tags every timed token as a warm hit (W), cold C fill (C)
+or Python fallback (P), aligned with all_mask_us.
 """
 
 import collections
@@ -22,14 +25,27 @@ import time
 
 import numpy as np
 
-from .engine import Engine
+from .engine import Engine, StageError
 from instagrammar.lexer_parser.compiler import LexerParserCompiler
 
-_CACHE_MAX = 8
+# MaskBench visits each schema once (files are shuffled, never revisited),
+# so a multi-entry LRU only multiplies peak memory: each compiled schema
+# pins its phase-4 tables plus a ~131 MB C mask cache. Keep one.
+_CACHE_MAX = 1
 
 
 class InstaGrammarLPEngine(Engine):
     """MaskBench engine for InstaGrammar (Lexer-Parser, unified serving path)."""
+
+    # Grammar workloads: InstaGrammar EBNF translated from PSC's GBNF
+    # (experiments/workloads/gbnf.py), i.e. the same language XGrammar gets.
+    grammar_format = "ig_ebnf"
+    benchmark_contract = {
+        "compile": "phases=4 + template + prewarm (INSTAGRAMMAR_PREWARM)",
+        "timed_operation": "fill_trace_row_into + mask-bit check + accept_token",
+        "acceptance": "token must be set in the complete mask; EOS bit "
+                      "checked after the last token",
+    }
 
     def __init__(self):
         super().__init__()
@@ -40,6 +56,7 @@ class InstaGrammarLPEngine(Engine):
         self._row = None
         self._extras = {}
         self._prewarm = None
+        self._path = []
         from instagrammar.lexer_parser._c_matcher import _available
         if not _available:
             raise RuntimeError(
@@ -62,7 +79,28 @@ class InstaGrammarLPEngine(Engine):
     def init(self):
         pass
 
+    def _ensure_compiler(self):
+        if self._compiler is None:
+            self._compiler = LexerParserCompiler(self.tokenizer)
+            self._row = np.zeros((self._compiler.vocab_size + 7) // 8,
+                                 dtype=np.uint8)
+
     def compile_grammar(self, schema: dict):
+        self._ensure_compiler()
+        key = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
+        self._load(key, lambda: self._compiler.compile_schema(schema, verbose=0, phases=4))
+
+    def compile_text_grammar(self, grammar: str):
+        self._ensure_compiler()
+        key = hashlib.sha256(grammar.encode()).hexdigest()
+        try:
+            self._load(key, lambda: self._compiler.compile_ebnf(grammar, verbose=0, phases=4))
+        except MemoryError:
+            raise
+        except ValueError as exc:
+            raise StageError("grammar_parser", repr(exc)) from exc
+
+    def _load(self, key, compile_fn):
         from instagrammar.lexer_parser._c_matcher import (
             CLPMatcher, _flatten_grammar, cancel_background_prewarms,
             prewarm_mode, start_prewarm)
@@ -70,26 +108,22 @@ class InstaGrammarLPEngine(Engine):
         # a previous schema's background walk must not compete with this
         # compile (or its timed fills) for CPU
         cancel_background_prewarms()
-        if self._compiler is None:
-            self._compiler = LexerParserCompiler(self.tokenizer)
-            self._row = np.zeros((self._compiler.vocab_size + 7) // 8,
-                                 dtype=np.uint8)
-
-        self._current_key = hashlib.sha256(
-            json.dumps(schema, sort_keys=True).encode()).hexdigest()
+        self._current_key = key
+        self._path = []
         self._prewarm = None
-        if self._current_key in self._cache:
-            self._cache.move_to_end(self._current_key)
-            self._compiled = self._cache[self._current_key]
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self._compiled = self._cache[key]
             self._extras = {"ig_prewarm_mode": mode, "ig_cache_hit": True,
                             "ig_compile_us": 0, "ig_matcher_init_us": 0,
                             "ig_prewarm_us": 0}
             return
 
         # phases=4: trace-signature table (complete masks by retrieval) --
-        # the exact compile the vLLM backend ships. TTFM == this call.
+        # the exact compile the vLLM backend ships. TTFM == this call,
+        # including the prewarm below.
         t0 = time.perf_counter()
-        compiled = self._compiler.compile_schema(schema, verbose=0, phases=4)
+        compiled = compile_fn()
         t1 = time.perf_counter()
         compiled._clp_flat = _flatten_grammar(compiled)
         compiled._clp_template = CLPMatcher(compiled)  # owns shared C cache
@@ -107,7 +141,7 @@ class InstaGrammarLPEngine(Engine):
             "ig_prewarm_us": int((t3 - t2) * 1e6),
         }
         self._compiled = compiled
-        self._cache[self._current_key] = compiled
+        self._cache[key] = compiled
         while len(self._cache) > _CACHE_MAX:
             evicted_key, _ = self._cache.popitem(last=False)
             if self._matcher_key == evicted_key:
@@ -156,6 +190,25 @@ class InstaGrammarLPEngine(Engine):
         except Exception as e:  # stats must never fail a benchmark row
             return {"ig_table_stats_error": repr(e)[:200]}
 
+    def compile_breakdown(self):
+        """The compile_extras() TTFM split under the audit runner's names."""
+        e = self._extras
+        if e.get("ig_cache_hit"):
+            return {"cache_hit": True}
+        pw = self._prewarm
+        return {
+            "compile_us": e.get("ig_compile_us"),
+            "template_us": e.get("ig_matcher_init_us"),
+            "prewarm_us": e.get("ig_prewarm_us"),
+            "prewarm_states": int(pw.states or 0) if pw is not None else 0,
+            "prewarm_mode": e.get("ig_prewarm_mode"),
+        }
+
+    def replay_stats(self):
+        path = "".join(self._path)
+        return {"mask_path": path, "warm": path.count("W"),
+                "cold": path.count("C"), "python": path.count("P")}
+
     def reset(self):
         if self._matcher is not None and self._matcher_key == self._current_key:
             self._matcher.reset()
@@ -167,18 +220,43 @@ class InstaGrammarLPEngine(Engine):
                                        template=self._compiled._clp_template)
             self._matcher_key = self._current_key
 
-    def compute_mask(self):
+    def _fill(self):
+        """Fill self._row with the complete mask; returns 'W', 'C' or 'P'."""
         m = self._matcher
         # ONE C call, warm AND cold: key -> shared C cache -> row memcpy;
         # a prewarm-missed state is assembled and inserted inside the call.
         st = m.fill_trace_row_into(self._row)
-        if st > 0:
-            return
+        if st == 1:
+            return "W"
+        if st == 2:
+            return "C"
         if st == -1:
-            raise RuntimeError("matcher state truncated (config explosion)")
+            raise StageError("config_explosion",
+                             "matcher state truncated (LP_MAX_CONFIGS/LP_MAX_ACTIVE)")
+        if st == -2:
+            raise MemoryError("matcher C allocation failed")
         # no C trace table attached: python retrieval fallback
-        mask = m.fill_next_token_bitmask_retrieval()
+        try:
+            mask = m.fill_next_token_bitmask_retrieval()
+        except RuntimeError as exc:
+            if "truncated" in str(exc):
+                raise StageError("config_explosion", str(exc)) from exc
+            raise
         m.fill_row_insert_into(np.ascontiguousarray(mask), self._row)
+        return "P"
+
+    def compute_mask(self):
+        self._path.append(self._fill())
+
+    def check_complete(self) -> bool:
+        self._fill()
+        return self.eos_allowed(self._row)
 
     def commit_token(self, t: int) -> bool:
+        # Judge the token by the MASK the engine just produced (as the
+        # llguidance adapter does), not only by the acceptor: a token the
+        # acceptor takes but the mask forbids is a mask-soundness error and
+        # must surface as a validation error, not be silently accepted.
+        if not (self._row[t >> 3] >> (t & 7)) & 1:
+            return False
         return self._matcher.accept_token(t)

@@ -1,245 +1,321 @@
-from .engine import Engine
-from .json_schema import json_schema_to_gbnf
+"""SynCode mask/advance adapter for MaskBench's schema-derived GBNF profile.
+
+This frontend is owned by the benchmark, not a native SynCode JSON Schema API.
+It preserves the converter's grammar, and reports conversion/parser/DFA failures
+separately. No logits-processor fallback or candidate-only validation is used.
+"""
+from copy import deepcopy
+import importlib
+import importlib.util
 import re
 import sys
-import torch
+import types
+
+from .engine import Engine
+from .json_schema import json_schema_to_gbnf
+
+
+class SyncodeAdapterError(ValueError):
+    def __init__(self, stage, message, outcome="error"):
+        super().__init__(message)
+        self.stage = stage
+        self.outcome = outcome
 
 
 def _import_syncode():
-    """Import syncode submodules while bypassing the broken top-level __init__.
-
-    syncode's ``__init__.py`` eagerly imports evaluation/dataset code
-    that requires data files not shipped with the pip package.  We work
-    around this by registering a stub package in ``sys.modules`` before
-    importing only the submodules we need.
-    """
-    if "syncode.grammar_decoder" in sys.modules:
-        return  # already imported
-
-    import types, importlib
-
+    # The 0.4.0 package initializer loads optional evaluation data absent from
+    # its wheel. Import only the grammar APIs, with an accurate package spec.
     if "syncode" not in sys.modules:
-        pkg = types.ModuleType("syncode")
-        import importlib.util
         spec = importlib.util.find_spec("syncode")
-        if spec and spec.submodule_search_locations:
-            pkg.__path__ = list(spec.submodule_search_locations)
-        else:
-            pkg.__path__ = []
+        if spec is None or not spec.submodule_search_locations:
+            raise ImportError("SynCode is not installed")
+        pkg = types.ModuleType("syncode")
+        pkg.__path__ = list(spec.submodule_search_locations)
         pkg.__package__ = "syncode"
+        pkg.__spec__ = spec
         sys.modules["syncode"] = pkg
-
-    importlib.import_module("syncode.common")
     importlib.import_module("syncode.parsers")
-    importlib.import_module("syncode.parsers.grammars")
-    importlib.import_module("syncode.mask_store")
-    importlib.import_module("syncode.grammar_decoder")
-
-
-def _tokenize_gbnf_body(body: str):
-    """Tokenize a GBNF rule body into (kind, text) chunks.
-
-    Single-pass left-to-right: at each position decide between a [...]
-    char class, a "..." string, an identifier, or anything else.  Char
-    classes can contain ``"`` which would otherwise confuse a string-
-    aware split, so they are recognized first.
-    """
-    i, n = 0, len(body)
-    while i < n:
-        c = body[i]
-        if c == '[':
-            j = i + 1
-            while j < n:
-                if body[j] == '\\' and j + 1 < n:
-                    j += 2; continue
-                if body[j] == ']':
-                    j += 1; break
-                j += 1
-            cls = body[i:j]
-            if j < n and body[j] == '{':
-                k = body.index('}', j) + 1
-                yield ('class_q', cls, body[j:k]); i = k
-            else:
-                yield ('class', cls); i = j
-        elif c == '"':
-            j = i + 1
-            while j < n:
-                if body[j] == '\\' and j + 1 < n:
-                    j += 2; continue
-                if body[j] == '"':
-                    j += 1; break
-                j += 1
-            yield ('str', body[i:j]); i = j
-        elif c.isalpha() or c == '_':
-            j = i
-            while j < n and (body[j].isalnum() or body[j] in '_-'):
-                j += 1
-            yield ('ident', body[i:j]); i = j
-        else:
-            yield ('other', c); i += 1
-
-
-# Standard JSON primitives expressed as Lark terminals (regex) instead
-# of recursive character-level rules.  Syncode's terminal-overapproximation
-# mask only handles cross-terminal tokens (e.g. the LLaMA token ``{"``)
-# correctly when strings are a single terminal.  The GBNF emitter builds
-# these out of ``char``/``string``/``number`` rules that don't fold into
-# terminals; we replace those rules wholesale with this preamble.
-_JSON_PRIMITIVES_PREAMBLE = r'''
-STRING: /"(?:[^"\\\x00-\x1f]|\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4}))*"/
-NUMBER: /-?(?:0|[1-9][0-9]{0,15})(?:\.[0-9]{1,16})?(?:[eE][-+]?[0-9]{1,16})?/
-BOOLEAN: "true" | "false"
-NULL: "null"
-%ignore /[ \t\n\r]+/
-?value: object | array | STRING | NUMBER | BOOLEAN | NULL
-array: "[" [value ("," value)*] "]"
-object: "{" [_pair ("," _pair)*] "}"
-_pair: STRING ":" value
-'''.strip()
-
-# Rule names emitted by ``json_schema_to_gbnf`` that we replace with the
-# preamble above.  Any GBNF rule with one of these names is dropped from
-# the output; references to them are remapped to the preamble's
-# definitions (``space`` is replaced by Lark's ``%ignore`` whitespace).
-_PRIMITIVE_RULES = {
-    'array', 'boolean', 'char', 'decimal-part', 'integral-part',
-    'null', 'number', 'object', 'space', 'string', 'value',
-}
+    importlib.import_module("syncode.mask_store.mask_store")
 
 
 def gbnf_to_lark(gbnf: str) -> str:
-    """Translate llama.cpp-style GBNF to a Lark grammar string.
+    """Translate the converter's GBNF subset without changing its primitives.
 
-    Schema-specific rules are translated mechanically (``::=`` → ``:``,
-    kebab-case → snake_case, char classes wrapped in ``/.../``).  The
-    universal JSON-primitive rules emitted by ``json_schema_to_gbnf``
-    (string, number, char, object, array, …) are dropped and replaced
-    by a regex-terminal preamble so Syncode's lexer can handle tokens
-    like ``{"`` that span a literal-and-string boundary.
+    Unsupported syntax is an explicit frontend failure. In particular no
+    generic JSON preamble, whitespace ignore, or grammar folding is inserted.
     """
-    rule_names = []
+    rules = {}
     for line in gbnf.splitlines():
-        m = re.match(r'^([A-Za-z_][A-Za-z0-9_-]*)\s*::=', line)
-        if m:
-            rule_names.append(m.group(1))
-    rename = {n: n.lower().replace('-', '_') for n in rule_names}
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        match = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_-]*)\s*::=\s*(.*)', line)
+        if not match or match[1] in rules:
+            raise ValueError(f"Invalid or duplicate GBNF rule: {line!r}")
+        rules[match[1]] = match[2]
+    if 'root' not in rules:
+        raise ValueError("GBNF requires a root rule")
+    names = {name: f'r_{i}' for i, name in enumerate(rules)}
 
-    out = []
-    for line in gbnf.splitlines():
-        if not line.strip():
-            out.append(line); continue
-        m = re.match(r'^([A-Za-z_][A-Za-z0-9_-]*)\s*::=\s*(.*)$', line)
-        if not m:
-            out.append(line); continue
-        if m.group(1) in _PRIMITIVE_RULES:
-            continue  # preamble defines this; skip the GBNF version
-        head = rename[m.group(1)]
-        parts = []
-        for chunk in _tokenize_gbnf_body(m.group(2)):
-            kind = chunk[0]
-            if kind == 'class':
-                parts.append('/' + chunk[1] + '/')
-            elif kind == 'class_q':
-                # Translate {m,n} into Lark's term-level ~m..n so zero-min
-                # quantifiers don't produce a zero-width regex terminal,
-                # which Lark's lexer rejects.
-                cls, q = chunk[1], chunk[2]
-                qm = re.match(r'\{(\d+)(?:,(\d*))?\}', q)
-                lo = qm.group(1)
-                hi = qm.group(2)
-                if hi is None:
-                    parts.append(f'/{cls}/ ~ {lo}')
-                else:
-                    parts.append(f'/{cls}/ ~ {lo}..{hi}')
-            elif kind == 'ident':
-                ref = chunk[1]
-                if ref == 'space':
-                    # Whitespace is `%ignore`d in the preamble; drop refs.
+    def translate(body):
+        pos = 0
+        def sequence(in_group=False):
+            nonlocal pos
+            parts = []
+            while pos < len(body):
+                c = body[pos]
+                if c.isspace():
+                    pos += 1
                     continue
-                if ref in _PRIMITIVE_RULES:
-                    # Map to the preamble's name (rule lowercase, terminals upper).
-                    parts.append({'string': 'STRING', 'number': 'NUMBER',
-                                  'boolean': 'BOOLEAN', 'null': 'NULL'}.get(
-                                      ref, ref))
+                if c == ')':
+                    if not in_group:
+                        raise ValueError("Unmatched closing parenthesis")
+                    pos += 1
+                    return ' '.join(parts)
+                if c == '|':
+                    parts.append('|')
+                    pos += 1
+                    continue
+                if c == '(':
+                    pos += 1
+                    atom = '(' + sequence(True) + ')'
+                elif c in '["':
+                    start = pos
+                    end = ']' if c == '[' else '"'
+                    pos += 1
+                    while pos < len(body):
+                        if body[pos] == '\\':
+                            pos += 2
+                        elif body[pos] == end:
+                            pos += 1
+                            break
+                        else:
+                            pos += 1
+                    else:
+                        raise ValueError("Unterminated GBNF literal or character class")
+                    atom = body[start:pos]
+                    if c == '[':
+                        atom = '/' + atom.replace('/', r'\/') + '/'
                 else:
-                    parts.append(rename.get(ref, ref))
-            else:
-                parts.append(chunk[1])
-        out.append(f'{head}: {"".join(parts)}')
-    # Lark requires a top-level rule named ``start``; GBNF uses ``root``.
-    if 'root' in rename.values() and 'start' not in rename.values():
-        out.insert(0, 'start: root')
-    return _JSON_PRIMITIVES_PREAMBLE + '\n' + '\n'.join(out)
+                    match = re.match(r'[A-Za-z_][A-Za-z0-9_-]*', body[pos:])
+                    if not match or match[0] not in names:
+                        raise ValueError(f"Unsupported GBNF syntax/reference: {body[pos:]!r}")
+                    pos += len(match[0])
+                    atom = names[match[0]]
+                while pos < len(body) and body[pos].isspace():
+                    pos += 1
+                if pos < len(body) and body[pos] in '?*+':
+                    atom += body[pos]
+                    pos += 1
+                elif pos < len(body) and body[pos] == '{':
+                    match = re.match(r'\{(\d+)(?:,(\d*))?\}', body[pos:])
+                    if not match:
+                        raise ValueError("Invalid GBNF quantifier")
+                    pos += len(match[0])
+                    lo, hi = int(match[1]), match[2]
+                    if hi == '':
+                        atom = f'({atom} ~ {lo} {atom}*)' if lo else f'{atom}*'
+                    elif hi is None:
+                        atom = f'{atom} ~ {lo}'
+                    else:
+                        if int(hi) < lo:
+                            raise ValueError("Reversed GBNF quantifier")
+                        atom = f'{atom} ~ {lo}..{hi}'
+                parts.append(atom)
+            if in_group:
+                raise ValueError("Unterminated GBNF group")
+            return ' '.join(parts)
+        return sequence()
+    return '\n'.join(['start: ' + names['root']] +
+                     [f'{names[name]}: {translate(body)}' for name, body in rules.items()])
+
+
+# Deliberately bounded converter admission profile, not SynCode capabilities.
+# The llama.cpp-derived converter has additional limitations (see status doc).
+_ANNOTATIONS = {'$schema', '$id', 'title', 'description', 'default', 'examples',
+                '$comment', 'deprecated', 'readOnly', 'writeOnly'}
+_KEYWORDS = {'type', 'properties', 'required', 'additionalProperties', 'items',
+             'minItems', 'maxItems', 'minLength', 'maxLength', 'minimum', 'maximum',
+             'exclusiveMinimum', 'exclusiveMaximum', 'enum', 'const', '$defs',
+             'definitions', '$ref', 'anyOf'}
+
+
+def _check_schema(schema, path='$'):
+    def unsupported(message):
+        raise SyncodeAdapterError('schema_conversion', f'{path}: {message}', 'unsupported')
+    if not isinstance(schema, dict):
+        unsupported('boolean/non-object schemas are outside this converter profile')
+    unknown = set(schema) - _ANNOTATIONS - _KEYWORDS
+    if unknown:
+        unsupported('unsupported converter keywords: ' + ', '.join(sorted(unknown)))
+    # Converter branch precedence otherwise silently discards these siblings.
+    constraints = set(schema) - _ANNOTATIONS - {'$defs', 'definitions'}
+    if isinstance(schema.get('type'), list) and constraints - {'type'}:
+        unsupported('type unions with sibling constraints are not admitted')
+    for exclusive in ('$ref', 'anyOf', 'enum', 'const'):
+        if exclusive in schema and constraints - {exclusive}:
+            unsupported(f'{exclusive} with sibling constraints is not admitted')
+    bounds = {'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum'} & set(schema)
+    if bounds and schema.get('type') != 'integer':
+        unsupported('numeric bounds require explicit integer type in this converter')
+    for lower, exclusive in (('minimum', 'exclusiveMinimum'), ('maximum', 'exclusiveMaximum')):
+        if lower in schema and exclusive in schema:
+            unsupported('simultaneous inclusive/exclusive bounds are not admitted')
+    if {'minItems', 'maxItems'} & set(schema):
+        if schema.get('type') != 'array' or not isinstance(schema.get('items'), dict):
+            unsupported('item bounds require array type and an items schema')
+    if {'minLength', 'maxLength'} & set(schema) and schema.get('type') != 'string':
+        unsupported('length bounds require explicit string type')
+    if 'required' in schema and schema.get('type') == 'object':
+        if not set(schema['required']) <= set(schema.get('properties', {})):
+            unsupported('required keys must have declared properties')
+    if 'type' not in schema and constraints & {'properties', 'required', 'additionalProperties', 'items'}:
+        unsupported('structural constraints require an explicit type')
+    for key in ('properties', '$defs', 'definitions'):
+        for name, child in schema.get(key, {}).items():
+            _check_schema(child, f'{path}/{key}/{name}')
+    for key in ('items', 'additionalProperties'):
+        if key in schema and isinstance(schema[key], dict):
+            _check_schema(schema[key], f'{path}/{key}')
+    if 'items' in schema and not isinstance(schema['items'], dict):
+        unsupported('tuple/boolean items are outside this converter profile')
+    for idx, child in enumerate(schema.get('anyOf', [])):
+        _check_schema(child, f'{path}/anyOf/{idx}')
 
 
 class SyncodeEngine(Engine):
+    benchmark_contract = {
+        'frontend': 'benchmark-llamacpp-gbnf-conservative-profile-v1',
+        'mode': 'grammar_strict', 'parser': 'lalr', 'cache': 'disabled',
+        'timed_operation': 'native-mask-plus-attempted-token-advance',
+        'acceptance': 'complete replay; EOS check outside timed token samples',
+    }
+
     def __init__(self):
         super().__init__()
-        self._input_ids = None
         self._accept_mask = None
-        self._processor = None
-        self._processor_factory = None
+        self._parse_result = None
+        self._input_ids = []
+        self._finished = False
 
     def get_id(self):
-        return "syncode"
+        return 'syncode'
 
     def get_name(self):
-        return "Syncode"
+        return 'SynCode (strict; benchmark GBNF frontend)'
 
     def get_module(self):
-        return "syncode"
+        return 'syncode'
 
     def init(self):
-        _import_syncode()
-        from syncode.grammar_decoder import SyncodeLogitsProcessor
+        # Defer dependency errors to compile_lark so the runner writes a row
+        # for each schema instead of aborting before any output is created.
+        pass
+
+    def _load_runtime(self):
+        try:
+            _import_syncode()
+        except Exception as exc:
+            raise SyncodeAdapterError('dependency', str(exc)) from exc
+
+    def compile_grammar(self, schema):
+        self._accept_mask = None
+        self._parse_result = None
+        _check_schema(schema)
+        try:
+            gbnf = json_schema_to_gbnf(deepcopy(schema))
+        except Exception as exc:
+            raise SyncodeAdapterError('schema_conversion', str(exc)) from exc
+        try:
+            grammar_text = gbnf_to_lark(gbnf)
+        except ValueError as exc:
+            raise SyncodeAdapterError('grammar_translation', str(exc), 'unsupported') from exc
+        self.compile_lark(grammar_text)
+
+    # PSC's matching: the reference Lark grammar (SynCode's own format).
+    grammar_format = "lark"
+
+    def compile_text_grammar(self, grammar_text):
+        self.compile_lark(grammar_text)
+
+    def compile_lark(self, grammar_text):
+        """Grammar-only entrypoint to isolate frontend and backend failures."""
+        self._load_runtime()
+        from syncode.parsers import create_base_parser
         from syncode.parsers.grammars import Grammar
-
-        # Defer processor construction to compile_grammar so the LALR
-        # tables and DFA mask cache are built per schema.
-        def make_processor(grammar_obj):
-            return SyncodeLogitsProcessor(
-                grammar=grammar_obj,
-                tokenizer=self.tokenizer,
-                use_cache=True,
-                parse_output_only=False,
-                num_samples=1,
-                parser="lalr",
-                mode="grammar_mask",
+        from syncode.parsers.incremental_parser import IncrementalParser
+        from syncode.mask_store.mask_store import MaskStore
+        self.log_single(grammar_text)
+        try:
+            grammar = Grammar(grammar_text)
+            base = create_base_parser(grammar, parser='lalr')
+            self._parser = IncrementalParser(base, ignore_whitespace=False)
+        except Exception as exc:
+            raise SyncodeAdapterError('grammar_parser', str(exc)) from exc
+        try:
+            # Direct constructor avoids upstream cache keys that only identify
+            # tokenizers by class and vocabulary size. Compilation is cold.
+            self._mask_store = MaskStore(
+                base.terminals, self.tokenizer, simplifications=grammar.simplifications(),
+                mode='grammar_strict', ignore_terminals=base.ignore_tokens,
+                parse_table=base.parser.parser._parse_table,
             )
+            self._byte_tokenizer = self._mask_store.byte_tokenizer
+            if any(not isinstance(v, bytes) for v in self._byte_tokenizer.vocab_byte.values()):
+                raise ValueError('SynCode byte tokenizer returned non-byte vocabulary entries')
+        except Exception as exc:
+            raise SyncodeAdapterError('mask_store', str(exc)) from exc
 
-        self._Grammar = Grammar
-        self._processor_factory = make_processor
-
-    def compile_grammar(self, schema: dict):
-        gbnf = json_schema_to_gbnf(schema)
-        lark = gbnf_to_lark(gbnf)
-        self.log_single(lark)
-        grammar = self._Grammar(lark)
-        self._processor = self._processor_factory(grammar)
+    def _parse(self):
+        raw = self._byte_tokenizer.decode(self._input_ids, skip_special_tokens=True)
+        try:
+            text = raw.decode('utf-8')
+            remainder = b''
+        except UnicodeDecodeError as exc:
+            if exc.reason != 'unexpected end of data':
+                raise
+            text, remainder = raw[:exc.start].decode('utf-8'), raw[exc.start:]
+        result = self._parser.get_acceptable_next_terminals(text)
+        result.remainder = result.remainder.encode('utf-8') + remainder
+        if remainder:
+            from syncode.parse_result import RemainderState
+            result.remainder_state = RemainderState.INCOMPLETE
+        return result
 
     def reset(self):
-        self._input_ids = torch.zeros((1, 0), dtype=torch.long)
+        self._input_ids = []
+        self._finished = False
         self._accept_mask = None
-        self._processor.reset()
+        self._parser.reset()
+        self._parse_result = self._parse()
 
     def compute_mask(self):
-        vocab_size = len(self.tokenizer)
-        scores = torch.zeros((1, vocab_size), dtype=torch.float32)
-        masked_scores = self._processor(self._input_ids, scores.clone())
-        self._accept_mask = masked_scores[0] > -float("inf")
+        try:
+            self._accept_mask = self._mask_store.get_accept_mask(self._parse_result).clone()
+        except Exception as exc:
+            raise SyncodeAdapterError('mask', str(exc)) from exc
 
-    def commit_token(self, t: int) -> bool:
-        # Syncode's ``__call__`` mask is a fast over-approximation that
-        # excludes valid cross-terminal tokens (e.g. ``{"`` at step 0).
-        # Its actual generation pipeline gates on ``is_valid``, which
-        # does a full incremental parse including the candidate token
-        # and uses ``is_valid_prefix`` instead of the upfront mask.  We
-        # mirror that behavior here so the maskbench accept/reject
-        # decision matches what Syncode would actually do during
-        # generation.
-        next_token = torch.tensor([t], dtype=torch.long)
-        ok = self._processor.is_valid(self._input_ids, next_token)
-        self._input_ids = torch.cat(
-            [self._input_ids, next_token.unsqueeze(0)], dim=1
-        )
-        return bool(ok)
+    def commit_token(self, token):
+        if self._accept_mask is None:
+            raise SyncodeAdapterError('advance', 'compute_mask must precede commit_token')
+        if self._finished or token < 0 or token >= len(self._accept_mask) or not self._accept_mask[token]:
+            return False
+        self._input_ids.append(int(token))
+        self._accept_mask = None
+        if token == self.tokenizer.eos_token_id:
+            self._finished = True
+            return True
+        try:
+            self._parse_result = self._parse()
+        except Exception as exc:
+            # A mask-admitted token that cannot advance is a backend error,
+            # not a valid rejection and never an unconstrained continuation.
+            raise SyncodeAdapterError('advance', str(exc)) from exc
+        return True
+
+    def check_complete(self):
+        """Check native EOS eligibility without consuming a speculative token."""
+        self.compute_mask()
+        eos = self.tokenizer.eos_token_id
+        if eos is None:
+            raise SyncodeAdapterError('completion', 'tokenizer has no EOS token')
+        return 0 <= eos < len(self._accept_mask) and bool(self._accept_mask[eos])
