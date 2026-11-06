@@ -57,6 +57,7 @@ class InstaGrammarLPEngine(Engine):
         self._extras = {}
         self._prewarm = None
         self._path = []
+        self._step = None
         from instagrammar.lexer_parser._c_matcher import _available
         if not _available:
             raise RuntimeError(
@@ -147,12 +148,14 @@ class InstaGrammarLPEngine(Engine):
             if self._matcher_key == evicted_key:
                 self._matcher = None
                 self._matcher_key = None
+                self._step = None
 
     def compile_extras(self) -> dict:
         """Per-schema TTFM split for the runner's status record. Read after
         the tests, so a background walk reports its states and wall time
         if it has finished (None while still running)."""
         extras = dict(self._extras)
+        extras["ig_binding"] = "direct" if self._step is not None else "ctypes"
         pw = self._prewarm
         if pw is not None:
             extras["ig_prewarm_states"] = pw.states
@@ -219,13 +222,16 @@ class InstaGrammarLPEngine(Engine):
             self._matcher = CLPMatcher(self._compiled, mask_cache={},
                                        template=self._compiled._clp_template)
             self._matcher_key = self._current_key
+            self._step = self._matcher.direct_step(self._row)
 
     def _fill(self):
         """Fill self._row with the complete mask; returns 'W', 'C' or 'P'."""
         m = self._matcher
         # ONE C call, warm AND cold: key -> shared C cache -> row memcpy;
         # a prewarm-missed state is assembled and inserted inside the call.
-        st = m.fill_trace_row_into(self._row)
+        st = self._step.fill() if self._step is not None else 0
+        if st == 0:
+            st = m.fill_trace_row_into(self._row)
         if st == 1:
             return "W"
         if st == 2:
@@ -257,6 +263,11 @@ class InstaGrammarLPEngine(Engine):
         # llguidance adapter does), not only by the acceptor: a token the
         # acceptor takes but the mask forbids is a mask-soundness error and
         # must surface as a validation error, not be silently accepted.
+        if self._step is not None:
+            result = self._step.accept(t)
+            if result == 2:
+                self._matcher._check_truncated()
+            return result == 1
         if not (self._row[t >> 3] >> (t & 7)) & 1:
             return False
         return self._matcher.accept_token(t)
