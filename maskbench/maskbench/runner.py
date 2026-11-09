@@ -42,7 +42,8 @@ def process_file(engine: Engine, file: str):
     A file is either a MaskBench schema ({"schema", "tests": [{"data",
     "valid"}]}) or a grammar workload ({"grammars": {format: text}, "tests":
     [{"text", "valid"}]}). Per token the runner records wall time
-    (all_mask_us) and this thread's CPU time (all_mask_cpu_us) of
+    (all_mask_us; all_mask_ns at full resolution) and this thread's
+    CPU time (all_mask_cpu_us) of
     compute_mask + commit_token; a large wall-minus-CPU gap marks a stall
     (preemption, page reclaim) rather than algorithmic cost. After the last
     token, engines implementing check_complete() are asked whether EOS is
@@ -78,6 +79,7 @@ def process_file(engine: Engine, file: str):
 
     all_mask_us = []
     all_mask_cpu_us = []
+    all_mask_ns = []
     status = {
         "id": id,
         "workload_kind": "grammar" if is_grammar else "json_schema",
@@ -90,6 +92,7 @@ def process_file(engine: Engine, file: str):
         "num_tests": len(pos_data["tests"]),
         "all_mask_us": all_mask_us,
         "all_mask_cpu_us": all_mask_cpu_us,
+        "all_mask_ns": all_mask_ns,
         "num_valid_tests": 0,
         "num_invalid_tests": 0,
         "adapter": getattr(engine, "benchmark_contract", None),
@@ -147,11 +150,13 @@ def process_file(engine: Engine, file: str):
             tokens = engine.tokenizer.encode(instance, add_special_tokens=False)
             engine.reset()
             for tidx, t in enumerate(tokens):
-                t2 = time.monotonic()
+                t2 = time.monotonic_ns()
                 c2 = time.thread_time()
                 engine.compute_mask()
                 ok = engine.commit_token(t)
-                mask_time = time_us(t2)
+                mask_ns = time.monotonic_ns() - t2
+                mask_time = mask_ns // 1000
+                all_mask_ns.append(mask_ns)
                 all_mask_cpu_us.append(int((time.thread_time() - c2) * 1e6))
                 if engine.debug:
                     engine.log_single(
@@ -249,7 +254,8 @@ def process_file(engine: Engine, file: str):
     status["complete"] = True
 
     engine.log_single(json.dumps({k: v for k, v in status.items()
-                                  if k not in ("all_mask_us", "all_mask_cpu_us")}, indent=2))
+                                  if k not in ("all_mask_us", "all_mask_cpu_us", "all_mask_ns",
+                                               "warm_all_mask_us", "warm_all_mask_ns")}, indent=2))
     _write_json(output_name, status)
 
     return status
@@ -264,6 +270,7 @@ def _warm_pass(engine: Engine, tests, cold_accepted, status):
     accept/reject result differs from the cold pass (expected: 0).
     """
     warm_all = []
+    warm_ns = []
     mismatches = 0
     for test, cold in zip(tests, cold_accepted):
         if "text" in test:
@@ -275,10 +282,12 @@ def _warm_pass(engine: Engine, tests, cold_accepted, status):
         try:
             engine.reset()
             for t in tokens:
-                t2 = time.monotonic()
+                t2 = time.monotonic_ns()
                 engine.compute_mask()
                 ok = engine.commit_token(t)
-                warm_all.append(time_us(t2))
+                dt = time.monotonic_ns() - t2
+                warm_ns.append(dt)
+                warm_all.append(dt // 1000)
                 if not ok:
                     accepted = False
                     break
@@ -289,6 +298,7 @@ def _warm_pass(engine: Engine, tests, cold_accepted, status):
             accepted = False
         mismatches += accepted != cold
     status["warm_all_mask_us"] = warm_all
+    status["warm_all_mask_ns"] = warm_ns
     status["warm_masks_us"] = sum(warm_all)
     status["warm_num_tokens"] = len(warm_all)
     status["warm_outcome_mismatches"] = mismatches
